@@ -139,10 +139,29 @@ wait_agent() {
 
 # Run a PowerShell snippet inside the guest through the guest agent and print
 # its stdout. The agent runs commands as SYSTEM, so no password is needed.
+#
+# The command is started ASYNCHRONOUSLY and polled: a synchronous
+# `qm guest exec` gives up after a few seconds on slow guests (the agent
+# answers "got timeout" even though the command is still running), which would
+# make callers believe the command failed. Here we wait up to ${2:-180}s.
+# Returns non-zero (with a message on stderr) if the command cannot be run or
+# does not finish in time, so callers never mistake "no answer" for "no".
 guest_ps() {
-  qm guest exec "$VMID" --timeout 180 -- powershell -NoProfile -NonInteractive \
-      -Command "$1" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.stdout.write(d.get("out-data","")); sys.stderr.write(d.get("err-data",""))'
+  local ps=$1 limit=${2:-180} out pid status waited=0
+  out=$(qm guest exec "$VMID" --synchronous 0 -- powershell -NoProfile -NonInteractive \
+          -Command "$ps" 2>&1) || { warn "guest-exec failed: $out"; return 1; }
+  pid=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pid"])' <<<"$out" 2>/dev/null) \
+    || { warn "Unexpected guest-exec answer: $out"; return 1; }
+  while :; do
+    # exec-status itself can time out while the guest is busy: just retry.
+    if status=$(qm guest exec-status "$VMID" "$pid" 2>/dev/null) \
+       && python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("exited") else 1)' <<<"$status" 2>/dev/null; then
+      break
+    fi
+    sleep 2; waited=$((waited + 2))
+    [[ $waited -lt $limit ]] || { warn "Guest command did not finish within ${limit}s."; return 1; }
+  done
+  python3 -c 'import json,sys; d=json.load(sys.stdin); sys.stdout.write(d.get("out-data","")); sys.stderr.write(d.get("err-data",""))' <<<"$status"
 }
 
 # ----------------------------------------------------------------------------
@@ -343,6 +362,8 @@ cmd_status() {
   qm config "$VMID" | grep -E '^(name|machine|bios|agent|scsihw|boot|vga|net[0-9]+|(ide|sata|scsi|virtio)[0-9]+):' || true
   if agent_up; then
     log "Guest agent is running. Windows-side view:"
+    # Single quotes are intentional: the text is PowerShell, not shell.
+    # shellcheck disable=SC2016
     guest_ps '
       "--- Disks (BusType SAS/SCSI with vioscsi = VirtIO SCSI; ATA/IDE = emulated)";
       Get-Disk | Select-Object Number,FriendlyName,BusType,Size | Format-Table -AutoSize | Out-String;
@@ -351,7 +372,7 @@ cmd_status() {
       "--- Network adapters";
       Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,LinkSpeed | Format-Table -AutoSize | Out-String;
       "--- VirtIO drivers staged in the driver store";
-      pnputil /enum-drivers | Select-String -Context 0,3 "Red Hat" | Out-String;
+      Get-WindowsDriver -Online | Where-Object { $_.ProviderName -match "Red Hat" } | Sort-Object OriginalFileName | ForEach-Object { "{0,-14} {1,-12} {2}" -f (Split-Path $_.OriginalFileName -Leaf), $_.ClassName, $_.Version } | Out-String;
       "--- Guest agent service";
       Get-Service QEMU-GA -ErrorAction SilentlyContinue | Select-Object Name,Status | Format-Table -AutoSize | Out-String'
   else
@@ -364,9 +385,10 @@ cmd_status() {
 # Abort unless Windows already has the VirtIO driver identified by $1 staged
 # in its driver store (otherwise switching the hardware would break the guest).
 require_guest_driver() {
-  local name=$1
-  guest_ps "if (pnputil /enum-drivers | Select-String -SimpleMatch '$name') { 'yes' } else { 'no' }" \
-    | grep -q yes \
+  local name=$1 answer
+  answer=$(guest_ps "if (pnputil /enum-drivers | Select-String -SimpleMatch '$name') { 'yes' } else { 'no' }") \
+    || die "Could not query the guest (see warning above); retry once the guest is idle."
+  [[ $answer == *yes* ]] \
     || die "Windows has no '$name' driver yet. Run Install-VirtioWin.ps1 in the guest first."
 }
 
@@ -415,16 +437,22 @@ free_scsi_slot() {
 # A staged-but-never-loaded driver is the classic cause of the
 # INACCESSIBLE_BOOT_DEVICE blue screen after changing the disk bus. We force
 # the load by hot-adding a tiny temporary VirtIO SCSI disk and rebooting once.
-# True when a SCSI controller driven by vioscsi is present and healthy.
+# Returns 0 when a SCSI controller driven by vioscsi is present and healthy,
+# 1 when it is not, and 2 when the guest could not be queried at all.
 # (Single quotes are intentional: the text is PowerShell, not shell.)
 # shellcheck disable=SC2016
 vioscsi_loaded() {
-  guest_ps 'Get-CimInstance Win32_SCSIController | Where-Object { $_.DriverName -eq "vioscsi" -and $_.Status -eq "OK" } | ForEach-Object { "loaded" }' \
-    | grep -q loaded
+  local out
+  out=$(guest_ps 'Get-CimInstance Win32_SCSIController | Where-Object { $_.DriverName -eq "vioscsi" -and $_.Status -eq "OK" } | ForEach-Object { "loaded" }') \
+    || return 2
+  [[ $out == *loaded* ]]
 }
 
 ensure_vioscsi_loaded() {
-  if vioscsi_loaded; then
+  local rc=0
+  vioscsi_loaded || rc=$?
+  [[ $rc -ne 2 ]] || die "Could not query the guest to check the vioscsi driver."
+  if [[ $rc -eq 0 ]]; then
     log "The vioscsi driver is already loaded in the guest."
     return
   fi
@@ -436,7 +464,7 @@ ensure_vioscsi_loaded() {
   run qm reboot "$VMID" --timeout 300
   if [[ $DRY_RUN -eq 0 ]]; then
     sleep 30; wait_agent 900
-    vioscsi_loaded || die "vioscsi is still not loaded after the reboot; the temporary disk $slot was kept for inspection."
+    vioscsi_loaded || die "vioscsi is still not loaded (or the guest could not be queried) after the reboot; the temporary disk $slot was kept for inspection."
   fi
   # Remove the temporary disk (first detach, then destroy the now-unused volume).
   run qm set "$VMID" --delete "$slot"
