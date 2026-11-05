@@ -78,6 +78,22 @@ cd qemu-win-virtio/proxmox
 Use `--dry-run` first if you want to see the `qm` commands without running
 them. `./proxmox-virtio-win.sh latest` only prints which ISO would be used.
 
+#### No network, no RDP, no agent? Use the helper ISO
+
+If you cannot reach the guest at all (typical right after a migration: no
+network driver, RDP unreachable), let `prepare` build a small extra CD-ROM that
+contains the installer and a launcher:
+
+```bash
+./proxmox-virtio-win.sh prepare --vmid 103 --installer-iso
+qm stop 103 && qm start 103      # IDE/SATA CD-ROMs are not hot-pluggable
+```
+
+Open the Proxmox web console of the VM, sign in, open the CD-ROM labelled
+`VIRTIO_INSTALLER` and double-click `Install-VirtioWin.cmd`: it elevates itself,
+bypasses the execution policy for that single process and runs the installer.
+(`xorriso`, `genisoimage` or `mkisofs` must be installed on the host.)
+
 ### 2. In the Windows guest: install drivers and agent
 
 Copy `windows/Install-VirtioWin.ps1` into the guest (RDP clipboard, a shared

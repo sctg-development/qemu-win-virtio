@@ -23,6 +23,10 @@
 # Commands
 #   latest    Print the newest virtio-win ISO version/URL found upstream.
 #   prepare   Download + attach the ISO, enable the agent (see above).
+#             With --installer-iso, also builds and attaches a small helper
+#             ISO holding Install-VirtioWin.ps1 and a double-click launcher:
+#             useful when the guest has no network, no RDP and no agent yet,
+#             so the only way in is the Proxmox console.
 #   status    Show the VM hardware bus/model types and, if the guest agent
 #             answers, the Windows-side view (disks, drivers, services).
 #   finalize  Switch NIC / VGA / boot disk to VirtIO (opt-in flags).
@@ -32,6 +36,7 @@
 #   --storage NAME    Proxmox storage that holds ISO images (default: local).
 #   --dry-run         Print the qm/pvesm commands instead of running them.
 #   --yes             Do not ask for confirmation before disruptive steps.
+#   --installer-iso   (prepare) build/attach the helper ISO described above.
 #   -h, --help        Show the help text.
 #
 # `finalize` options
@@ -73,6 +78,7 @@ DO_NIC=0
 DO_VGA=0
 DO_DISK=0
 DO_SNAPSHOT=1
+INSTALLER_ISO=0
 COMMAND=""
 
 # ----------------------------------------------------------------------------
@@ -216,6 +222,72 @@ free_cdrom_slot() {
   die "No free IDE/SATA slot available for the CD-ROM drive."
 }
 
+# Build a tiny ISO (label VIRTIO_INSTALLER) that contains the guest-side
+# installer script plus a launcher, and print its volume id. The script is taken
+# from the repository checkout next to this file; if absent (script copied
+# alone), it is downloaded from GitHub.
+build_installer_iso() {
+  local here src tmp iso_name path tool
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  src="$here/../windows/Install-VirtioWin.ps1"
+  iso_name="qemu-win-virtio-installer.iso"
+  path=$(pvesm path "$STORAGE:iso/$iso_name") || die "Storage '$STORAGE' has no 'iso' content type."
+  tool=$(command -v xorriso || command -v genisoimage || command -v mkisofs || true)
+  [[ -n $tool ]] || die "xorriso, genisoimage or mkisofs is required for --installer-iso (apt install xorriso)."
+
+  tmp=$(mktemp -d)
+  # Always remove the temporary directory, whatever happens.
+  trap 'rm -rf "$tmp"' RETURN
+  if [[ -f $src ]]; then
+    cp "$src" "$tmp/Install-VirtioWin.ps1"
+  else
+    log "Install-VirtioWin.ps1 not found next to this script; downloading it from GitHub"
+    curl -fsSL "https://raw.githubusercontent.com/sctg-development/qemu-win-virtio/main/windows/Install-VirtioWin.ps1" \
+      -o "$tmp/Install-VirtioWin.ps1" || die "Cannot download Install-VirtioWin.ps1"
+  fi
+  # Launcher: re-launches itself elevated if needed, then runs the PowerShell
+  # installer with a process-scoped execution policy bypass (no system change).
+  # CRLF line endings because it is a Windows batch file.
+  printf '%s\r\n' \
+    '@echo off' \
+    'rem Self-elevate if not running as Administrator.' \
+    'net session >nul 2>&1' \
+    'if errorlevel 1 (' \
+    '  powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath \"%~f0\""' \
+    '  exit /b' \
+    ')' \
+    'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-VirtioWin.ps1"' \
+    'pause' > "$tmp/Install-VirtioWin.cmd"
+
+  log "Building helper ISO $path"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '\033[1;35m[DRY ]\033[0m %s -o %s ... (contains Install-VirtioWin.ps1, Install-VirtioWin.cmd)\n' "$tool" "$path" >&2
+  elif [[ $(basename "$tool") == xorriso ]]; then
+    "$tool" -as mkisofs -quiet -V VIRTIO_INSTALLER -J -r -o "$path" "$tmp"
+  else
+    "$tool" -quiet -V VIRTIO_INSTALLER -J -r -o "$path" "$tmp"
+  fi
+  echo "$STORAGE:iso/$iso_name"
+}
+
+# Attach an ISO as a CD-ROM on a free slot unless it is already attached.
+attach_cdrom() {
+  local volid=$1 slot
+  if qm config "$VMID" | grep -q "^\(ide\|sata\)[0-9]*:.*$volid"; then
+    log "$volid already attached."
+    return
+  fi
+  slot=$(free_cdrom_slot)
+  log "Attaching $volid as CD-ROM on $slot"
+  run qm set "$VMID" --"$slot" "$volid,media=cdrom"
+  # IDE/SATA devices cannot be hot-plugged: on a running VM the new drive stays
+  # in the "pending" section until the VM is fully stopped and started again
+  # (a guest-initiated reboot is NOT enough).
+  if [[ $DRY_RUN -eq 0 ]] && qm pending "$VMID" 2>/dev/null | grep -q "^new.*$slot"; then
+    warn "$slot is pending: stop and start the VM (qm stop $VMID && qm start $VMID) to make the CD-ROM appear."
+  fi
+}
+
 cmd_prepare() {
   local dir url volid slot attached
   read -r dir url < <(find_latest_iso)
@@ -238,6 +310,10 @@ cmd_prepare() {
     run qm set "$VMID" --"$slot" "$volid,media=cdrom"
   fi
 
+  if [[ $INSTALLER_ISO -eq 1 ]]; then
+    attach_cdrom "$(build_installer_iso)"
+  fi
+
   # The guest agent option only tells Proxmox to create the virtio-serial
   # channel; the agent itself is installed by Install-VirtioWin.ps1.
   if [[ $(vm_conf_value agent) != 1* ]]; then
@@ -257,6 +333,8 @@ cmd_prepare() {
 Next step: inside the Windows guest, open an elevated PowerShell and run
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\Install-VirtioWin.ps1
 (the ISO is available as a CD-ROM drive). See README.md for details.
+With --installer-iso, simply open the VIRTIO_INSTALLER CD-ROM in the guest and
+run Install-VirtioWin.cmd (it elevates itself).
 EOF
 }
 
@@ -452,6 +530,7 @@ while [[ $# -gt 0 ]]; do
     --storage)     STORAGE=${2:?--storage needs a value}; shift 2 ;;
     --dry-run)     DRY_RUN=1; shift ;;
     --yes)         ASSUME_YES=1; shift ;;
+    --installer-iso) INSTALLER_ISO=1; shift ;;
     --nic)         DO_NIC=1; shift ;;
     --vga)         DO_VGA=1; shift ;;
     --disk)        DO_DISK=1; shift ;;
