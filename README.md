@@ -60,10 +60,16 @@ are signed by Microsoft (WHQL) / Red Hat.
 * For `status` and `finalize`: the QEMU guest agent must be running in the
   guest (installed by `Install-VirtioWin.ps1`).
 
-Tested on Proxmox VE 9.2 with a Windows Server 2025 guest (prepare, status,
-guest installation and verification). The `finalize --disk` sequence follows the
-procedure validated by hand on the same VM; use `--dry-run` and keep the
-snapshot until you have checked the result.
+Tested on Proxmox VE 9.2 with Windows Server 2025 guests:
+
+* `prepare`, `status`, `--installer-iso` and `Install-VirtioWin.ps1`: validated
+  on two VMs (a P2V-migrated server and a Hyper-V import).
+* Disk bus change (`finalize --disk`): the manual procedure it automates worked
+  on the first VM (a P2V-migrated server). On the second VM (a Hyper-V import that itself
+  runs Hyper-V/Docker) Windows did **not** boot from the VirtIO SCSI disk (it fell
+  into the recovery environment) and the VM was rolled back to the snapshot taken
+  by the script, which restored it intact. Root cause not determined yet, so treat
+  `--disk` as the delicate step: keep the snapshot, watch the console, use `--dry-run` first.
 
 ## Step by step
 

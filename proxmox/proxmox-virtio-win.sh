@@ -491,8 +491,8 @@ switch_disk() {
   require_guest_driver "vioscsi.inf"
   confirm "Switch boot disk $key ($volid) to VirtIO SCSI? The VM will be rebooted and then shut down."
 
+  local snap=""
   if [[ $DO_SNAPSHOT -eq 1 ]]; then
-    local snap
     snap="virtio-pre-$(date +%Y%m%d-%H%M%S)"
     log "Taking snapshot $snap (rollback: qm rollback $VMID $snap)"
     run qm snapshot "$VMID" "$snap" --description "Before VirtIO disk migration"
@@ -509,18 +509,23 @@ switch_disk() {
   opts=$(tr ',' '\n' <<<"$opts" | grep -Ev '^(size|media|discard|iothread)=' | paste -sd, - || true)
   newslot=$(free_scsi_slot)
   log "Moving $volid from $key to $newslot"
-  run qm set "$VMID" --delete "$key"
-  run qm set "$VMID" --"$newslot" "$volid,discard=on,iothread=1${opts:+,$opts}"
-
-  # Replace the old device name in the boot order.
+  # Read the boot order BEFORE detaching the disk: Proxmox silently removes a
+  # detached device from "boot: order=", so reading it afterwards would lose
+  # the entry and leave the VM without a bootable disk.
   order=$(vm_conf_value boot); order=${order#order=}
   order=$(sed -E "s/(^|;)$key(;|$)/\1$newslot\2/" <<<"$order")
+
+  run qm set "$VMID" --delete "$key"
+  run qm set "$VMID" --"$newslot" "$volid,discard=on,iothread=1${opts:+,$opts}"
   run qm set "$VMID" --boot "order=$order"
 
   log "Starting VM $VMID"
   run qm start "$VMID"
   if [[ $DRY_RUN -eq 0 ]]; then
-    wait_agent 900
+    # If Windows cannot boot from the new bus (typically INACCESSIBLE_BOOT_DEVICE
+    # or an automatic-repair loop) the agent never answers: tell the user how
+    # to go back instead of leaving a bare timeout message.
+    ( wait_agent 900 ) 2>/dev/null || die "The guest did not come back after the disk change. Check the VM console, then roll back: qm stop $VMID; qm rollback $VMID ${snap:-<snapshot>}; qm start $VMID"
     guest_ps 'Get-Disk | Select-Object Number,FriendlyName,BusType,Size | Format-Table -AutoSize | Out-String'
   fi
   log "Done. If the guest fails to boot: stop it, then 'qm rollback $VMID <snapshot>'."
