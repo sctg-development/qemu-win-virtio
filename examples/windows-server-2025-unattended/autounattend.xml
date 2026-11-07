@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  autounattend.xml - unattended installation of Windows Server 2025 Standard
+  Core (no GUI) on a Proxmox/QEMU VM whose disk is a VirtIO SCSI disk.
+
+  What it does
+    1. windowsPE : sets the language, partitions disk 0 for UEFI/GPT (EFI 100 MB, MSR 16 MB, Windows =
+       remaining space) and installs image index 1 (Standard, Server Core).
+    2. specialize: names the computer and copies the post-install scripts from this
+       CD-ROM to C:\Windows\Setup\Scripts. Windows runs SetupComplete.cmd from that
+       folder at the very end of setup, as SYSTEM, before the first logon.
+    3. oobeSystem: skips the EULA/privacy pages. NO password is stored here: the
+       first console screen asks you to set the Administrator password.
+
+  No product key is set: volume-licensing media install without one. Activate
+  later with `slmgr /ipk <key>` then `slmgr /ato`.
+
+  Adapt the values marked EDIT ME. Image index: 1 = Standard (Core), 2 = Standard
+  (Desktop Experience), 3/4 = Datacenter, 5/6 = Turbine.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>fr-FR</InputLocale>        <!-- EDIT ME: keyboard layout -->
+      <SystemLocale>fr-FR</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>fr-FR</UserLocale>
+    </component>
+
+
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add"><Order>1</Order><Type>EFI</Type><Size>100</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>2</Order><Type>MSR</Type><Size>16</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>3</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format><Label>System</Label></ModifyPartition>
+            <ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>2</PartitionID></ModifyPartition>
+            <ModifyPartition wcm:action="add"><Order>3</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>1</Value></MetaData> <!-- EDIT ME -->
+          </InstallFrom>
+          <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <ComputerName>RUNNER-VS2010</ComputerName>   <!-- EDIT ME (15 characters max) -->
+      <TimeZone>Romance Standard Time</TimeZone>    <!-- EDIT ME -->
+    </component>
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c mkdir C:\Windows\Setup\Scripts</Path>
+        </RunSynchronousCommand>
+        <!-- The CD-ROM holding this file has an unknown letter: look for it. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c for %i in (D E F G H I J K) do if exist %i:\SetupComplete.cmd copy /y %i:\SetupComplete.cmd C:\Windows\Setup\Scripts\SetupComplete.cmd</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c for %i in (D E F G H I J K) do if exist %i:\Post-Install.ps1 copy /y %i:\Post-Install.ps1 C:\Windows\Setup\Scripts\Post-Install.ps1</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c for %i in (D E F G H I J K) do if exist %i:\Install-VirtioWin.ps1 copy /y %i:\Install-VirtioWin.ps1 C:\Windows\Setup\Scripts\Install-VirtioWin.ps1</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>cmd /c for %i in (D E F G H I J K) do if exist %i:\Install-Docker.ps1 copy /y %i:\Install-Docker.ps1 C:\Windows\Setup\Scripts\Install-Docker.ps1</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+    </component>
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <InputLocale>fr-FR</InputLocale>
+      <SystemLocale>fr-FR</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>fr-FR</UserLocale>
+    </component>
+  </settings>
+</unattend>

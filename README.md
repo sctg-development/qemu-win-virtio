@@ -179,6 +179,39 @@ Network and display changes take effect at the next full stop/start of the VM
 (`--disk` does that for you). When the NIC model changes, Windows sees a new
 adapter: static IP settings of the old adapter are not carried over automatically.
 
+## Installing a new VM directly on VirtIO (integrated ISO)
+
+For a **new** VM you can skip the migration steps altogether: build a Windows
+installation ISO that already contains the VirtIO drivers.
+
+1. In any Windows machine, as Administrator, with the virtio-win ISO attached and the
+   `boot.wim` / `install.wim` of the Windows ISO copied to a local folder:
+   ```powershell
+   .\windows\Add-VirtioDriversToWim.ps1 -DriverRoot E:\ -BootWim C:\iso\boot.wim -InstallWim C:\iso\install.wim
+   ```
+   Both images of `boot.wim` (WinPE and Setup) and all images of `install.wim` get the
+   drivers (`-InstallIndex 1` limits it to one edition, which is much faster). A few
+   packages (for example `smbus`) are refused by WinPE; the script warns and goes on.
+2. Put the modified WIM files back into the `sources` folder of the extracted ISO and
+   rebuild it. `install.wim` is larger than 4 GiB, so the ISO needs UDF:
+   ```bash
+   genisoimage -udf -allow-limited-size -iso-level 3 -allow-lowercase -relaxed-filenames \
+     -V WIN2025_VIRTIO -b boot/etfsboot.com -no-emul-boot -boot-load-size 8 \
+     -eltorito-alt-boot -e efi/microsoft/boot/efisys_noprompt.bin -no-emul-boot \
+     -o Server2025-virtio.iso tree/
+   ```
+   (`-e` marks the second El Torito entry as UEFI. `xorriso -as mkisofs` has no UDF.)
+3. Create the VM with `scsihw virtio-scsi-single`, a VirtIO SCSI disk, a `virtio` NIC and
+   `--vga virtio`; Setup sees the disk and the network card without a driver prompt.
+   [`examples/windows-server-2025-unattended`](examples/windows-server-2025-unattended)
+   contains an `autounattend.xml` (Server Core, GPT) and first-boot scripts that install
+   the guest agent, enable Remote Desktop, add Hyper-V/Containers and Docker CE. Put them
+   on a small extra ISO (`genisoimage -J -R -V UNATTEND`).
+
+With the integrated ISO, `DriverPaths` entries in `autounattend.xml` are unnecessary. In
+one test Setup stopped with error `0x80070103 - 0x40031` while they were present and
+succeeded once they were removed (the cause was not isolated further).
+
 ## Verifying VirtIO is really used
 
 In the guest, as Administrator:
